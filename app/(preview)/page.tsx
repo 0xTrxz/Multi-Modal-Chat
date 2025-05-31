@@ -293,7 +293,22 @@ export default function Home() {
                     >
                       <TextFilePreview file={file} />
                     </motion.div>
-                  ) : null
+                  ) : (
+                    <motion.div
+                      key={`${file.name}-${idx}`}
+                      className="w-16 h-16 flex flex-col items-center justify-center overflow-hidden text-zinc-500 border p-2 rounded-lg bg-white dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-400"
+                      initial={{ scale: 0.8, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      exit={{
+                        y: -10,
+                        scale: 1.1,
+                        opacity: 0,
+                        transition: { duration: 0.2 },
+                      }}
+                    >
+                      <FilePreview file={file} />
+                    </motion.div>
+                  )
                 )}
               </div>
             )}
