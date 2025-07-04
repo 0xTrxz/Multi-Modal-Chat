@@ -1,0 +1,258 @@
+import { openai } from "@ai-sdk/openai";
+import { streamText } from "ai";
+
+// Define types for better type safety
+type ChatMessage = {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  id?: string;
+};
+
+type AttachmentType = {
+  name: string;
+  contentType: string;
+  url: string;
+};
+
+// Increase the webhook timeout (30 seconds instead of 10)
+const WEBHOOK_TIMEOUT_MS = 60000;
+
+// Helper to log response information
+function logResponse(source: string, status: number, contentType: string, isStreaming = false) {
+  console.log('[DEBUG] Response Info:', {
+    source,
+    status,
+    contentType,
+    isStreaming,
+    timestamp: new Date().toISOString()
+  });
+}
+
+export async function POST(req: Request) {
+  const startTime = Date.now();
+  try {
+    // Safely parse request body with error handling
+    const body = await req.json().catch(error => {
+      console.error('[DEBUG] Failed to parse request JSON:', error);
+      return {};
+    });
+    
+    // Destructure with validation
+    const { messages, chatId, experimental_attachments } = body;
+    
+    // Log debugging information
+    console.log('[DEBUG] API Request:', { 
+      messagesCount: messages?.length,
+      hasAttachments: !!experimental_attachments,
+      chatId: chatId || 'none',
+      firstMessageContent: messages?.[0]?.content?.slice(0, 50)
+    });
+    
+    // Validate required fields
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      console.error('[DEBUG] Missing or invalid messages field');
+      const response = new Response(
+        JSON.stringify({ 
+          error: 'Missing or invalid messages field',
+          details: 'The messages array must be provided and not empty'
+        }), 
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+      logResponse('validation_error', 400, 'application/json');
+      return response;
+    }
+    
+    // Check if n8n webhook integration is enabled
+    if (process.env.USE_N8N_WEBHOOK === 'true') {
+      // Validate webhook URL
+      const webhookUrl = process.env.N8N_WEBHOOK_URL;
+      if (!webhookUrl) {
+        console.error('[DEBUG] N8N webhook URL not configured');
+        // Fallback to direct OpenAI if webhook URL is missing
+        return fallbackToDirectOpenAI(messages);
+      }
+      
+      try {
+        // Call n8n webhook with increased timeout
+        console.log('[DEBUG] Calling n8n webhook:', webhookUrl);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          console.error(`[DEBUG] Webhook request timed out after ${WEBHOOK_TIMEOUT_MS}ms`);
+          controller.abort();
+        }, WEBHOOK_TIMEOUT_MS);
+        
+        const requestStartTime = Date.now();
+        const n8nResponse = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            // Add a keepalive header to help with longer connections
+            'Connection': 'keep-alive'
+          },
+          body: JSON.stringify({ 
+            messages, 
+            chatId, 
+            experimental_attachments,
+            timeout: WEBHOOK_TIMEOUT_MS // Pass timeout info to webhook
+          }),
+          signal: controller.signal
+        });
+        const requestDuration = Date.now() - requestStartTime;
+        
+        clearTimeout(timeoutId);
+        
+        console.log(`[DEBUG] N8N webhook response received in ${requestDuration}ms:`, {
+          status: n8nResponse.status,
+          statusText: n8nResponse.statusText,
+          headers: Object.fromEntries([...n8nResponse.headers.entries()])
+        });
+        
+        // Check if response is OK
+        if (!n8nResponse.ok) {
+          console.error(`[DEBUG] N8N webhook error: ${n8nResponse.status} ${n8nResponse.statusText}`);
+          
+          // Add detailed debugging for 404 errors
+          if (n8nResponse.status === 404) {
+            try {
+              // Clone the response to read the body twice
+              const responseClone = n8nResponse.clone();
+              const errorBody = await responseClone.text();
+              console.error('[DEBUG] N8N 404 details:', {
+                url: webhookUrl,
+                responseBody: errorBody.substring(0, 500), // Only show first 500 chars in case it's large
+                urlPath: new URL(webhookUrl).pathname
+              });
+              
+              // Test if the webhook base URL is reachable
+              const baseUrl = new URL(webhookUrl);
+              baseUrl.pathname = '/';
+              console.log('[DEBUG] Testing webhook base URL:', baseUrl.toString());
+            } catch (parseError) {
+              console.error('[DEBUG] Failed to parse webhook error response:', parseError);
+            }
+          }
+          
+          return fallbackToDirectOpenAI(messages);
+        }
+        
+        // Handle n8n response based on content type
+        const contentType = n8nResponse.headers.get('Content-Type') || '';
+        console.log('[DEBUG] N8N response content type:', contentType);
+        
+        if (contentType.includes('application/json')) {
+          // Parse JSON response
+          const result = await n8nResponse.json();
+          console.log('[DEBUG] N8N JSON response received:', {
+            hasMessages: !!result.messages,
+            messagesCount: result.messages?.length,
+            responseKeys: Object.keys(result),
+            responseSize: JSON.stringify(result).length
+          });
+          
+          // If n8n returns a messages array for streaming
+          if (result.messages && Array.isArray(result.messages)) {
+            // Stream the n8n messages back using openai model as a proxy
+            const streamResult = streamText({
+              model: openai("gpt-4o"),
+              messages: result.messages,
+            });
+            const response = streamResult.toDataStreamResponse();
+            logResponse('n8n_proxy_stream', 200, 'text/event-stream', true);
+            return response;
+          } else {
+            // Return direct JSON response
+            const response = new Response(JSON.stringify(result), { 
+              status: 200, 
+              headers: { 
+                'Content-Type': 'application/json'
+              } 
+            });
+            logResponse('n8n_json', 200, 'application/json');
+            return response;
+          }
+        } else if (contentType.includes('text/event-stream')) {
+          // Pass through streaming response
+          console.log('[DEBUG] Streaming response from n8n');
+          const response = new Response(n8nResponse.body, { 
+            status: 200, 
+            headers: { 
+              'Content-Type': 'text/event-stream'
+            } 
+          });
+          logResponse('n8n_stream', 200, 'text/event-stream', true);
+          return response;
+        } else {
+          // For other content types, just pass through
+          console.log('[DEBUG] Unknown content type from n8n:', contentType);
+          const response = new Response(n8nResponse.body, { 
+            status: 200, 
+            headers: { 
+              'Content-Type': contentType
+            } 
+          });
+          logResponse('n8n_other', 200, contentType);
+          return response;
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          console.error('[DEBUG] Webhook request was aborted due to timeout');
+          const response = new Response(
+            JSON.stringify({ 
+              error: 'Webhook timeout',
+              details: `The webhook request timed out after ${WEBHOOK_TIMEOUT_MS}ms`
+            }), 
+            { status: 504, headers: { 'Content-Type': 'application/json' } }
+          );
+          logResponse('webhook_timeout', 504, 'application/json');
+          return response;
+        }
+        
+        console.error('[DEBUG] Error calling n8n webhook:', error);
+        return fallbackToDirectOpenAI(messages);
+      }
+    } else {
+      // Use direct OpenAI integration (current implementation)
+      console.log('[DEBUG] Using direct OpenAI integration');
+      return fallbackToDirectOpenAI(messages);
+    }
+  } catch (error) {
+    console.error('[DEBUG] Unhandled error in chat API:', error);
+    const response = new Response(
+      JSON.stringify({ 
+        error: 'Internal server error', 
+        details: error instanceof Error ? error.message : String(error),
+        processingTime: `${Date.now() - startTime}ms`
+      }), 
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+    logResponse('unhandled_error', 500, 'application/json');
+    return response;
+  }
+}
+
+// Helper function for fallback to direct OpenAI (current implementation)
+function fallbackToDirectOpenAI(messages: ChatMessage[]) {
+  try {
+    console.log('[DEBUG] Fallback to OpenAI with', messages.length, 'messages');
+    const result = streamText({
+      model: openai("gpt-4o"),
+      system:
+        "do not respond on markdown or lists, keep your responses brief, you can ask the user to upload images or documents if it could help you understand the problem better",
+      messages,
+    });
+    const response = result.toDataStreamResponse();
+    logResponse('openai_fallback', 200, 'text/event-stream', true);
+    return response;
+  } catch (error) {
+    console.error('[DEBUG] Error in OpenAI fallback:', error);
+    const response = new Response(
+      JSON.stringify({ 
+        error: 'OpenAI API error', 
+        details: error instanceof Error ? error.message : String(error)
+      }), 
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+    logResponse('openai_fallback_error', 500, 'application/json');
+    return response;
+  }
+}
