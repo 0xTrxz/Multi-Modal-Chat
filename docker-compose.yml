@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  multi-modal-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      # Copy from your .env file or set these in your environment
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - USE_N8N_WEBHOOK=${USE_N8N_WEBHOOK:-true}
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - REPLICATE_API_TOKEN=${REPLICATE_API_TOKEN}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      # Mount local .env for development
+      - ./.env:/app/.env:ro
+    networks:
+      - chat-network
+
+networks:
+  chat-network:
+    driver: bridge
